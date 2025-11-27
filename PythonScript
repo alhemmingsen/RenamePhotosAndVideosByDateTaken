@@ -1,0 +1,171 @@
+import os
+import sys
+from datetime import datetime
+from PIL import Image
+from PIL.ExifTags import TAGS
+
+def get_date_taken(filepath):
+    """Extract Date Taken from EXIF data"""
+    try:
+        image = Image.open(filepath)
+        exifdata = image.getexif()
+        
+        # Look for DateTimeOriginal (when photo was taken)
+        for tag_id, value in exifdata.items():
+            tag = TAGS.get(tag_id, tag_id)
+            if tag == 'DateTimeOriginal':
+                # Format: '2025:04:06 12:54:00'
+                dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
+                return dt, "Date Taken"
+            elif tag == 'DateTime':
+                dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
+                return dt, "Date"
+    except Exception as e:
+        pass
+    
+    # Fallback to file modification time
+    return datetime.fromtimestamp(os.path.getmtime(filepath)), "Date Modified"
+
+def rename_photos(folder_path, suffix=""):
+    """Rename all photos based on Date Taken"""
+    counter = {}
+    renamed_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    print(f"\n📁 Scanning folder: {folder_path}")
+    if suffix:
+        print(f"🏷️  Suffix: _{suffix}")
+    
+    # Get all image files
+    all_files = os.listdir(folder_path)
+    files = [f for f in all_files 
+             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.3gp'))]
+    
+    print(f"📷 Found {len(files)} media files out of {len(all_files)} total files")
+    
+    # Show example of new naming format
+    example_base = "20250406_125400"
+    if suffix:
+        example_new = f"{example_base}_{suffix}.jpg"
+    else:
+        example_new = f"{example_base}.jpg"
+    print(f"📝 Example output: {example_new}")
+    
+    # Ask for confirmation
+    response = input(f"\n⚠️  This will rename {len(files)} files. Continue? (yes/no): ")
+    if response.lower() not in ['yes', 'y']:
+        print("Operation cancelled.")
+        return
+    
+    print("\n🔄 Starting rename process...\n")
+    
+    # Track date sources
+    date_sources = {"Date Taken": 0, "Date": 0, "Date Modified": 0}
+    
+    for i, filename in enumerate(files, 1):
+        filepath = os.path.join(folder_path, filename)
+        
+        try:
+            # Get date taken
+            date_taken, source = get_date_taken(filepath)
+            date_sources[source] += 1
+            
+            # Format new name: YYYYMMDD_HHMMSS
+            new_base = date_taken.strftime('%Y%m%d_%H%M%S')
+            
+            # Handle duplicates
+            if new_base in counter:
+                counter[new_base] += 1
+                new_base = f"{new_base}_{counter[new_base]:02d}"
+            else:
+                counter[new_base] = 0
+            
+            # Add suffix if provided
+            if suffix:
+                new_base = f"{new_base}_{suffix}"
+            
+            # Add extension
+            ext = os.path.splitext(filename)[1].lower()
+            new_name = new_base + ext
+            
+            # Rename
+            if filename != new_name:
+                new_path = os.path.join(folder_path, new_name)
+                
+                # Check if target exists
+                if os.path.exists(new_path):
+                    print(f"⚠️  Skipped {filename} - target name already exists")
+                    skipped_count += 1
+                else:
+                    os.rename(filepath, new_path)
+                    renamed_count += 1
+                    
+                    # Show first few renames as examples
+                    if renamed_count <= 5:
+                        print(f"✅ {filename}")
+                        print(f"   → {new_name} (using {source})")
+                    elif renamed_count == 6:
+                        print(f"   ... (showing first 5 only)")
+            else:
+                skipped_count += 1
+                
+            # Progress indicator for large batches
+            if i % 500 == 0:
+                print(f"⏳ Progress: {i}/{len(files)} files processed...")
+                
+        except KeyboardInterrupt:
+            print("\n\n❌ Operation cancelled by user!")
+            break
+        except Exception as e:
+            error_count += 1
+            if error_count <= 5:
+                print(f"❌ Error with {filename}: {str(e)}")
+    
+    # Summary
+    print("\n" + "="*60)
+    print("📊 SUMMARY:")
+    print("="*60)
+    print(f"✅ Successfully renamed: {renamed_count} files")
+    print(f"⏭️  Skipped (already correct): {skipped_count} files")
+    print(f"❌ Errors: {error_count} files")
+    print(f"\n📅 Date sources used:")
+    for source, count in date_sources.items():
+        if count > 0:
+            print(f"   - {source}: {count} files")
+    print("="*60)
+
+def main():
+    print("="*60)
+    print("📷 PHOTO RENAMER - Rename by Date Taken (EXIF)")
+    print("="*60)
+    print("\nThis will rename photos like:")
+    print("  20250928_214220_1035.jpg → 20250406_125400.jpg")
+    print("  (uses actual date photo was taken)")
+    
+    # Get folder path
+    folder = input("\n📁 Enter folder path (or drag folder here): ").strip().strip('"')
+    
+    # Validate folder
+    if not os.path.exists(folder):
+        print(f"\n❌ Error: Folder '{folder}' not found!")
+        print("   Make sure to enter the full path like: C:\\EvelynPHone")
+        return
+    
+    if not os.path.isdir(folder):
+        print(f"\n❌ Error: '{folder}' is not a folder!")
+        return
+    
+    # Get optional suffix
+    suffix = input("\n🏷️  Enter suffix to add (or press Enter for none): ").strip()
+    
+    # Process
+    rename_photos(folder, suffix)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+    finally:
+        input("\n📌 Press Enter to exit...")
