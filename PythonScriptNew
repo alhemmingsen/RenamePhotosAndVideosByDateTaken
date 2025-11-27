@@ -1,0 +1,326 @@
+import os
+import sys
+import json
+import re
+from datetime import datetime
+from PIL import Image
+from PIL.ExifTags import TAGS
+
+# Try to import pymediainfo
+try:
+    from pymediainfo import MediaInfo
+    MEDIAINFO_AVAILABLE = True
+except ImportError:
+    MEDIAINFO_AVAILABLE = False
+
+def get_date_from_filename(filepath):
+    """Extract date from filename patterns like 20250727_193327 or VID_20250321_111214"""
+    filename = os.path.basename(filepath)
+    name_without_ext = os.path.splitext(filename)[0]
+    
+    # Pattern: YYYYMMDD_HHMMSS (with optional prefix like VID_ or IMG_)
+    pattern = r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})'
+    match = re.search(pattern, name_without_ext)
+    
+    if match:
+        try:
+            year, month, day, hour, minute, second = match.groups()
+            dt = datetime(int(year), int(month), int(day), 
+                         int(hour), int(minute), int(second))
+            
+            # Sanity check: date should be reasonable (2000-2099)
+            if 2000 <= dt.year <= 2099:
+                return dt, "Filename"
+        except ValueError:
+            pass
+    
+    return None, None
+
+def get_date_from_json(filepath):
+    """Extract date from Google Takeout JSON sidecar file"""
+    json_paths = [
+        filepath + '.json',
+        os.path.splitext(filepath)[0] + '.json',
+    ]
+    
+    for json_path in json_paths:
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                if 'photoTakenTime' in data:
+                    timestamp = int(data['photoTakenTime']['timestamp'])
+                    dt = datetime.fromtimestamp(timestamp)
+                    return dt, "Google Takeout JSON"
+                
+                if 'creationTime' in data:
+                    timestamp = int(data['creationTime']['timestamp'])
+                    dt = datetime.fromtimestamp(timestamp)
+                    return dt, "Google Takeout JSON"
+                    
+            except Exception:
+                pass
+    
+    return None, None
+
+def get_date_from_pil(filepath):
+    """Extract Date Taken from EXIF data using PIL"""
+    try:
+        image = Image.open(filepath)
+        exifdata = image.getexif()
+        
+        for tag_id, value in exifdata.items():
+            tag = TAGS.get(tag_id, tag_id)
+            if tag == 'DateTimeOriginal':
+                dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
+                return dt, "Date Taken (EXIF)"
+            elif tag == 'DateTime':
+                dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
+                return dt, "Date (EXIF)"
+    except Exception:
+        pass
+    return None, None
+
+def get_date_from_mediainfo(filepath):
+    """Extract date from media file using pymediainfo"""
+    if not MEDIAINFO_AVAILABLE:
+        return None, None
+    
+    try:
+        media_info = MediaInfo.parse(filepath)
+        
+        for track in media_info.tracks:
+            if track.track_type == "General":
+                date_fields = [
+                    ('encoded_date', "Encoded Date"),
+                    ('tagged_date', "Tagged Date"),
+                    ('recorded_date', "Recorded Date"),
+                    ('file_creation_date', "Creation Date"),
+                ]
+                
+                for field, source_name in date_fields:
+                    value = getattr(track, field, None)
+                    if value:
+                        dt = parse_mediainfo_date(value)
+                        if dt:
+                            return dt, source_name
+    except Exception:
+        pass
+    return None, None
+
+def parse_mediainfo_date(value):
+    """Parse various date formats from MediaInfo"""
+    if not value:
+        return None
+    
+    value = str(value).replace('UTC ', '').strip()
+    
+    formats = [
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%d',
+        '%Y:%m:%d %H:%M:%S',
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+def get_date_taken(filepath):
+    """Extract date from file using best available method"""
+    ext = os.path.splitext(filepath)[1].lower()
+    file_modified = datetime.fromtimestamp(os.path.getmtime(filepath))
+    
+    # FIRST: Check for Google Takeout JSON sidecar
+    dt, source = get_date_from_json(filepath)
+    if dt:
+        return dt, source
+    
+    # For standard images, try PIL first
+    if ext in ('.jpg', '.jpeg', '.png'):
+        dt, source = get_date_from_pil(filepath)
+        if dt:
+            return dt, source
+    
+    # For videos and HEIC, try pymediainfo
+    if ext in ('.mp4', '.3gp', '.heic', '.mov'):
+        dt, source = get_date_from_mediainfo(filepath)
+        if dt:
+            return dt, source
+    
+    # For HEIC, also try PIL as fallback
+    if ext == '.heic':
+        dt, source = get_date_from_pil(filepath)
+        if dt:
+            return dt, source
+    
+    # For videos: if filename has a date and it's OLDER than file modified,
+    # use the filename date (likely Google Photos download scenario)
+    if ext in ('.mp4', '.3gp', '.mov'):
+        filename_dt, filename_source = get_date_from_filename(filepath)
+        if filename_dt and filename_dt < file_modified:
+            return filename_dt, "Filename (Google Photos)"
+    
+    # Final fallback: file modification time
+    return file_modified, "Date Modified (file)"
+
+def rename_photos(folder_path, suffix=""):
+    """Rename all photos based on Date Taken"""
+    counter = {}
+    renamed_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    print(f"\n📁 Scanning folder: {folder_path}")
+    if suffix:
+        print(f"🏷️  Suffix: _{suffix}")
+    
+    # Check for JSON files (Google Takeout)
+    all_files = os.listdir(folder_path)
+    json_count = len([f for f in all_files if f.lower().endswith('.json')])
+    if json_count > 0:
+        print(f"📋 Found {json_count} JSON sidecar files (Google Takeout)")
+    
+    # Check pymediainfo availability
+    if MEDIAINFO_AVAILABLE:
+        print("✅ pymediainfo available (better video/HEIC support)")
+    else:
+        print("⚠️  pymediainfo not installed - will use filename dates for videos")
+        print("   Install with: pip install pymediainfo")
+    
+    # Get all media files
+    files = [f for f in all_files 
+             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.heic', '.mp4', '.3gp', '.mov'))]
+    
+    print(f"📷 Found {len(files)} media files out of {len(all_files)} total files")
+    
+    # Show example of new naming format
+    example_base = "20250406_125400"
+    if suffix:
+        example_new = f"{example_base}_{suffix}.jpg"
+    else:
+        example_new = f"{example_base}.jpg"
+    print(f"📝 Example output: {example_new}")
+    
+    # Ask for confirmation
+    response = input(f"\n⚠️  This will rename {len(files)} files. Continue? (yes/no): ")
+    if response.lower() not in ['yes', 'y']:
+        print("Operation cancelled.")
+        return
+    
+    print("\n🔄 Starting rename process...\n")
+    
+    # Track date sources
+    date_sources = {}
+    
+    for i, filename in enumerate(files, 1):
+        filepath = os.path.join(folder_path, filename)
+        
+        try:
+            # Get date taken
+            date_taken, source = get_date_taken(filepath)
+            date_sources[source] = date_sources.get(source, 0) + 1
+            
+            # Format new name: YYYYMMDD_HHMMSS
+            new_base = date_taken.strftime('%Y%m%d_%H%M%S')
+            
+            # Handle duplicates
+            if new_base in counter:
+                counter[new_base] += 1
+                new_base = f"{new_base}_{counter[new_base]:02d}"
+            else:
+                counter[new_base] = 0
+            
+            # Add suffix if provided
+            if suffix:
+                new_base = f"{new_base}_{suffix}"
+            
+            # Add extension
+            ext = os.path.splitext(filename)[1].lower()
+            new_name = new_base + ext
+            
+            # Rename
+            if filename != new_name:
+                new_path = os.path.join(folder_path, new_name)
+                
+                # Check if target exists
+                if os.path.exists(new_path):
+                    print(f"⚠️  Skipped {filename} - target name already exists")
+                    skipped_count += 1
+                else:
+                    os.rename(filepath, new_path)
+                    renamed_count += 1
+                    
+                    # Show first few renames as examples
+                    if renamed_count <= 5:
+                        print(f"✅ {filename}")
+                        print(f"   → {new_name} (using {source})")
+                    elif renamed_count == 6:
+                        print(f"   ... (showing first 5 only)")
+            else:
+                skipped_count += 1
+                
+            # Progress indicator for large batches
+            if i % 500 == 0:
+                print(f"⏳ Progress: {i}/{len(files)} files processed...")
+                
+        except KeyboardInterrupt:
+            print("\n\n❌ Operation cancelled by user!")
+            break
+        except Exception as e:
+            error_count += 1
+            if error_count <= 5:
+                print(f"❌ Error with {filename}: {str(e)}")
+    
+    # Summary
+    print("\n" + "="*60)
+    print("📊 SUMMARY:")
+    print("="*60)
+    print(f"✅ Successfully renamed: {renamed_count} files")
+    print(f"⏭️  Skipped (already correct): {skipped_count} files")
+    print(f"❌ Errors: {error_count} files")
+    print(f"\n📅 Date sources used:")
+    for source, count in sorted(date_sources.items(), key=lambda x: -x[1]):
+        print(f"   - {source}: {count} files")
+    print("="*60)
+
+def main():
+    print("="*60)
+    print("📷 PHOTO RENAMER - Rename by Date Taken")
+    print("="*60)
+    print("\nThis will rename photos/videos like:")
+    print("  IMG_1035.jpg → 20250406_125400.jpg")
+    print("  VID_20250321_111214.mp4 → 20250321_111214.mp4")
+    print("  (uses actual date media was captured)")
+    print("\n✨ Supports Google Photos filename dates!")
+    
+    # Get folder path
+    folder = input("\n📁 Enter folder path (or drag folder here): ").strip().strip('"')
+    
+    # Validate folder
+    if not os.path.exists(folder):
+        print(f"\n❌ Error: Folder '{folder}' not found!")
+        print("   Make sure to enter the full path like: C:\\EvelynPhone")
+        return
+    
+    if not os.path.isdir(folder):
+        print(f"\n❌ Error: '{folder}' is not a folder!")
+        return
+    
+    # Get optional suffix
+    suffix = input("\n🏷️  Enter suffix to add (or press Enter for none): ").strip()
+    
+    # Process
+    rename_photos(folder, suffix)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+    finally:
+        input("\n📌 Press Enter to exit...")
