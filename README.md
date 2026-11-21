@@ -35,6 +35,31 @@ EXIF DateTime is written a second or so later, file modified dates become the do
 from Google Photos, and video metadata is in UTC at the end of the recording. Trusting the name keeps photos
 and videos from a trip abroad in the same local time.
 
+## Fixing a wrong camera clock
+
+Cameras don't set their own clocks. If one was left on home time abroad (or set to the wrong zone),
+its shots land hours away from the phone photos of the same moments once everything is merged.
+`--shift` corrects a numbered range of files before naming:
+
+```
+python photo_renamer.py "D:\Camera" --suffix Camera --shift DSC_0925-DSC_1369=+13h --shift DSC_1370-DSC_1796=-2h
+python photo_renamer.py "D:\Camera" --suffix Camera --shift camera_shifts.txt
+```
+
+A shifts file has one `RANGE=OFFSET` per line (`#` for comments). Offsets look like `+13h`, `-2.5h`, `-2h30m`, `+45m`.
+The preview shows how many files each shift matched and marks every corrected file.
+
+Camera videos are dated by the camera's displayed clock (the file's modified time, when it equals the
+embedded UTC time plus a whole time-zone step), so one shift fits a camera's photos and videos alike.
+
+To work out the offset, compare a camera shot with a phone photo of the same moment.
+
+## Merging devices into one folder
+
+Rename each device's folder with its own suffix (`--suffix Al`, `--suffix Camera`, ...) before merging.
+Two devices can take photos in the same second, and without a suffix the names would collide when copied
+together. Explorer's name sort then interleaves all devices in true chronological order.
+
 ## Naming
 
 - Descriptive parts of the old name are kept after the date:

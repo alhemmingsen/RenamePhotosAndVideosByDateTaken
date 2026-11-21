@@ -18,10 +18,13 @@ Rules:
   * RAW files (DSC_0001.NEF) get the same new name as their JPG twin (DSC_0001.JPG).
   * Name clashes get _01, _02 ... never an overwrite.
   * Every run writes a preview CSV first; applying writes a log that --undo can reverse.
+  * --shift fixes a camera whose clock was wrong for a range of shots (e.g. left on home
+    time abroad): DSC_0925-DSC_1369=+13h. Shifts can also live in a text file, one per line.
+    Camera videos use the camera's displayed clock, so the same shift fits photos and videos.
 
 Usage:
   python photo_renamer.py                          (interactive)
-  python photo_renamer.py FOLDER [--suffix Al] [--preview]
+  python photo_renamer.py FOLDER [--suffix Al] [--preview] [--shift RANGE=OFFSET | --shift shifts.txt]
   python photo_renamer.py --undo rename_log_....csv
 """
 import os
@@ -215,25 +218,27 @@ def get_date_from_tiff_raw(filepath):
 
 def parse_video_date(value):
     """MediaInfo dates: '2025-05-03 14:35:32 UTC', 'UTC 2025-...', or ISO with offset.
-    Returns local (naive) time on this PC."""
+    Returns (local naive time on this PC, timezone-aware time or None)."""
     value = str(value).strip()
     is_utc = 'UTC' in value
     value = value.replace('UTC', '').strip()
     m = re.match(r'(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s*([+-]\d{2}:?\d{2}|Z)?', value)
     if not m:
-        return None
+        return None, None
     dt = make_dt(*m.groups()[:6])
     if not dt:
-        return None
+        return None, None
     off = m.group(7)
     if off and off != 'Z':
         sign = 1 if off[0] == '+' else -1
         digits = off[1:].replace(':', '')
         tz = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
-        return dt.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
-    if is_utc or off == 'Z':
-        return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-    return dt
+        aware = dt.replace(tzinfo=tz)
+    elif is_utc or off == 'Z':
+        aware = dt.replace(tzinfo=timezone.utc)
+    else:
+        return dt, None
+    return aware.astimezone().replace(tzinfo=None), aware
 
 
 def get_date_from_video(filepath):
@@ -246,10 +251,21 @@ def get_date_from_video(filepath):
             # Apple's creation date carries the real local offset - prefer it
             for field in ('comapplequicktimecreationdate', 'recorded_date', 'encoded_date', 'tagged_date'):
                 value = getattr(track, field, None)
-                if value:
-                    dt = parse_video_date(value)
-                    if valid_dt(dt):
-                        return dt, "Video metadata"
+                if not value:
+                    continue
+                dt, aware = parse_video_date(value)
+                if not valid_dt(dt):
+                    continue
+                # Cameras stamp the file with their own displayed clock; if the modified
+                # date is the UTC time plus a whole time-zone step, that's the camera's
+                # local time - the same clock its photos use.
+                if aware is not None:
+                    modified = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    diff = (modified - aware.astimezone(timezone.utc).replace(tzinfo=None)).total_seconds()
+                    step = round(diff / 900) * 900
+                    if abs(diff) <= 16 * 3600 and abs(diff - step) <= 5:
+                        return modified.replace(microsecond=0), "Video (camera clock)"
+                return dt, "Video metadata"
     except Exception:
         pass
     return None, None
@@ -317,7 +333,63 @@ def is_canonical(name):
     return bool(m) and make_dt(*NAME_DATE_RE.match(m.group(1)).groups()) is not None
 
 
-def build_plan(folder, suffix, use_modified):
+# ---------------------------------------------------------------- clock corrections
+
+SHIFT_RE = re.compile(r'^\s*(?P<a>[^=]+?)(?:\s*-\s*(?P<b>[^=\-]+?))?\s*=\s*'
+                      r'(?P<sign>[+-])\s*(?:(?P<h>\d+(?:\.\d+)?)h)?\s*(?:(?P<m>\d+)m)?\s*$', re.I)
+
+
+def split_number(stem):
+    m = re.match(r'^(.*?)(\d+)$', stem)
+    return (m.group(1).lower(), int(m.group(2))) if m else (stem.lower(), None)
+
+
+def parse_shift(spec):
+    """'DSC_0925-DSC_1369=+13h', 'DSC_0925=-2h30m', 'DSC_1797-DSC_2160=-2.5h'
+    -> (prefix, first, last, timedelta, text)"""
+    m = SHIFT_RE.match(spec)
+    if not m or not (m.group('h') or m.group('m')):
+        raise ValueError(f"Can't read time shift '{spec}' - use e.g. DSC_0925-DSC_1369=+13h")
+    a_prefix, a_num = split_number(os.path.splitext(m.group('a').strip())[0])
+    b_prefix, b_num = split_number(os.path.splitext((m.group('b') or m.group('a')).strip())[0])
+    if a_num is None or b_num is None or a_prefix != b_prefix:
+        raise ValueError(f"Range in '{spec}' must be like DSC_0925-DSC_1369 (same prefix, numbered)")
+    sign = 1 if m.group('sign') == '+' else -1
+    delta = sign * timedelta(hours=float(m.group('h') or 0), minutes=int(m.group('m') or 0))
+    return a_prefix, min(a_num, b_num), max(a_num, b_num), delta, spec.strip()
+
+
+def load_shifts(items):
+    """Shift specs and/or paths to text files of them (one per line, # comments)."""
+    shifts = []
+    for item in items:
+        item = item.strip().strip('"')
+        if not item:
+            continue
+        if os.path.isfile(item):
+            with open(item, encoding='utf-8') as f:
+                lines = [ln.split('#')[0].strip() for ln in f]
+            shifts += [parse_shift(ln) for ln in lines if ln]
+        else:
+            shifts += [parse_shift(s) for s in item.split(';') if s.strip()]
+    return shifts
+
+
+def shift_for(stem, shifts):
+    prefix, num = split_number(stem)
+    for s in shifts:
+        if num is not None and prefix == s[0] and s[1] <= num <= s[2]:
+            return s
+    return None
+
+
+def describe_delta(delta):
+    minutes = int(delta.total_seconds() // 60)
+    sign, minutes = ('+' if minutes >= 0 else '-'), abs(minutes)
+    return f"{sign}{minutes // 60}h" + (f"{minutes % 60:02d}m" if minutes % 60 else "")
+
+
+def build_plan(folder, suffix, use_modified, shifts=()):
     """Return list of dicts: old, new, date, source, status."""
     all_names = os.listdir(folder)
     media = sorted(f for f in all_names
@@ -326,6 +398,7 @@ def build_plan(folder, suffix, use_modified):
     plan = []
     by_stem = {}            # old stem (lower) -> new stem, for RAW+JPG pairs
     pending = []
+    shift_used = {s[4]: 0 for s in shifts}
 
     print(f"🔍 Reading dates from {len(media)} files...")
     for i, f in enumerate(media, 1):
@@ -333,16 +406,22 @@ def build_plan(folder, suffix, use_modified):
             print(f"   {i}/{len(media)}")
         path = os.path.join(folder, f)
         stem, ext = os.path.splitext(f)
-        if is_canonical(f):
+        shift = shift_for(stem, shifts)
+        if is_canonical(f) and not shift:
             new_stem = stem
             if suffix and not stem.endswith('_' + suffix):
                 new_stem = f"{stem}_{suffix}"
+            occupied.add((new_stem + ext).lower())
             plan.append(dict(old=f, new_stem=new_stem, ext=ext, date=stem[:15],
                              source="Already dated name", raw=ext.lower() in RAW_EXTS))
             continue
         dt, source = find_date(path)
         if not dt and use_modified:
             dt, source = datetime.fromtimestamp(os.path.getmtime(path)), "File modified date"
+        if dt and shift:
+            dt += shift[3]
+            source = f"{source} {describe_delta(shift[3])} clock fix"
+            shift_used[shift[4]] += 1
         pending.append(dict(old=f, stem=stem, ext=ext, dt=dt, source=source,
                             raw=ext.lower() in RAW_EXTS))
 
@@ -385,6 +464,8 @@ def build_plan(folder, suffix, use_modified):
             e['status'] = "unchanged"
         else:
             e['status'] = "rename"
+    for spec, n in shift_used.items():
+        print(f"   🕒 {spec}: {n} files" + ("   ⚠️  matched nothing" if not n else ""))
     plan.sort(key=lambda e: e['old'].lower())
     return plan
 
@@ -414,7 +495,7 @@ def ask(prompt, default=False):
 
 # ---------------------------------------------------------------- main flows
 
-def rename_photos(folder, suffix="", preview_only=False):
+def rename_photos(folder, suffix="", preview_only=False, shifts=()):
     folder = os.path.abspath(folder)
     report_dir = os.path.dirname(os.path.abspath(__file__))
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -427,7 +508,7 @@ def rename_photos(folder, suffix="", preview_only=False):
         print("⚠️  pymediainfo not installed - videos without a dated name can't be dated")
         print("   Install with: pip install pymediainfo")
 
-    plan = build_plan(folder, suffix, use_modified=False)
+    plan = build_plan(folder, suffix, use_modified=False, shifts=shifts)
     undated = [e for e in plan if e['status'].startswith("no date")]
 
     if undated:
@@ -438,7 +519,7 @@ def rename_photos(folder, suffix="", preview_only=False):
             print("   ⚠️  This folder looks freshly downloaded/copied: modified dates are the")
             print("      download time, not when the photos were taken. Answer no.")
         if ask("   Use each file's modified date for these? (yes/NO): "):
-            plan = build_plan(folder, suffix, use_modified=True)
+            plan = build_plan(folder, suffix, use_modified=True, shifts=shifts)
 
     renames = [e for e in plan if e['status'] == "rename"]
     preview_path = os.path.join(report_dir, f"rename_preview_{tag}_{stamp}.csv")
@@ -514,6 +595,9 @@ def main():
     parser.add_argument('--suffix', default=None, help="text to add after the date, e.g. Al")
     parser.add_argument('--preview', action='store_true', help="write the preview list only, rename nothing")
     parser.add_argument('--undo', metavar='LOG', help="reverse a previous run using its rename_log CSV")
+    parser.add_argument('--shift', action='append', default=[], metavar='RANGE=OFFSET',
+                        help="fix a wrong camera clock, e.g. DSC_0925-DSC_1369=+13h or a text file of these "
+                             "(one per line); repeatable")
     args = parser.parse_args()
 
     if args.undo:
@@ -534,7 +618,17 @@ def main():
     suffix = args.suffix
     if suffix is None:
         suffix = input("\n🏷️  Enter suffix to add (or press Enter for none): ").strip()
-    rename_photos(folder, clean_label(suffix), args.preview)
+    shift_items = args.shift
+    if not args.folder:
+        answer = input("\n🕒 Camera clock fixes - a shifts file, or e.g. DSC_0925-DSC_1369=+13h; DSC_1370-DSC_1796=-2h\n"
+                       "   (press Enter for none): ").strip()
+        shift_items = shift_items + [answer]
+    try:
+        shifts = load_shifts(shift_items)
+    except ValueError as ex:
+        print(f"\n❌ {ex}")
+        return
+    rename_photos(folder, clean_label(suffix), args.preview, shifts)
 
 
 if __name__ == "__main__":
