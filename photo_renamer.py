@@ -24,13 +24,21 @@ Rules:
 
 Usage:
   python photo_renamer.py                          (interactive)
-  python photo_renamer.py FOLDER [--suffix Al] [--preview] [--shift RANGE=OFFSET | --shift shifts.txt]
-  python photo_renamer.py --undo rename_log_....csv
+  python photo_renamer.py FOLDER [--suffix NAME] [--preview] [--shift RANGE=OFFSET | --shift shifts.txt]
+  python photo_renamer.py FOLDER --fix-time 20260101-20260719=-1h [--only Camera] [--preview]
+                                                   (shift names already renamed, e.g. a camera clock
+                                                    found wrong later; works on a merged folder too)
+  python photo_renamer.py --undo rename_log_....csv | all  [--moved-to FOLDER]
+                                                   (every rename is logged as it happens, to its run's
+                                                    log and to rename_history.csv; 'all' reverses every
+                                                    run, newest first; --moved-to finds files that were
+                                                    moved after renaming and puts them back)
 """
 import os
 import sys
 import csv
 import json
+import glob
 import re
 import struct
 import argparse
@@ -383,13 +391,37 @@ def shift_for(stem, shifts):
     return None
 
 
+FIX_RE = re.compile(r'^\s*(?P<a>\d{8}(?:_\d{4,6})?)\s*(?:-\s*(?P<b>\d{8}(?:_\d{4,6})?))?\s*=\s*'
+                    r'(?P<sign>[+-])\s*(?:(?P<h>\d+(?:\.\d+)?)h)?\s*(?:(?P<m>\d+)m)?\s*$', re.I)
+
+
+def parse_fix(spec):
+    """'20260101-20260719=-1h', '20260405_1200-20260405_1830=+30m' (ends inclusive)
+    -> (first, last, timedelta, text) for already-renamed files"""
+    m = FIX_RE.match(spec)
+    if not m or not (m.group('h') or m.group('m')):
+        raise ValueError(f"Can't read time fix '{spec}' - use e.g. 20260101-20260719=-1h")
+
+    def bound(text, end):
+        day, _, clock = text.partition('_')
+        clock += ('235959' if end else '000000')[len(clock):]   # 20260719 as an end = all that day
+        return make_dt(day[:4], day[4:6], day[6:], clock[:2], clock[2:4], clock[4:])
+
+    first, last = bound(m.group('a'), False), bound(m.group('b') or m.group('a'), True)
+    if not first or not last or first > last:
+        raise ValueError(f"Bad date range in '{spec}'")
+    sign = 1 if m.group('sign') == '+' else -1
+    delta = sign * timedelta(hours=float(m.group('h') or 0), minutes=int(m.group('m') or 0))
+    return first, last, delta, spec.strip()
+
+
 def describe_delta(delta):
     minutes = int(delta.total_seconds() // 60)
     sign, minutes = ('+' if minutes >= 0 else '-'), abs(minutes)
     return f"{sign}{minutes // 60}h" + (f"{minutes % 60:02d}m" if minutes % 60 else "")
 
 
-def build_plan(folder, suffix, use_modified, shifts=()):
+def build_plan(folder, suffix, shifts=()):
     """Return list of dicts: old, new, date, source, status."""
     all_names = os.listdir(folder)
     media = sorted(f for f in all_names
@@ -416,8 +448,9 @@ def build_plan(folder, suffix, use_modified, shifts=()):
                              source="Already dated name", raw=ext.lower() in RAW_EXTS))
             continue
         dt, source = find_date(path)
-        if not dt and use_modified:
-            dt, source = datetime.fromtimestamp(os.path.getmtime(path)), "File modified date"
+        if not dt:
+            dt = trusted_modified(path)
+            source = "File modified date" if dt else None
         if dt and shift:
             dt += shift[3]
             source = f"{source} {describe_delta(shift[3])} clock fix"
@@ -470,13 +503,15 @@ def build_plan(folder, suffix, use_modified, shifts=()):
     return plan
 
 
-def looks_freshly_downloaded(folder, names):
-    """True if nearly all modified dates fall within a couple of hours (a bulk download/copy)."""
-    times = sorted(os.path.getmtime(os.path.join(folder, n)) for n in names)
-    if len(times) < 20:
-        return False
-    lo, hi = times[len(times) // 20], times[-(len(times) // 20) - 1]
-    return hi - lo < 3 * 3600
+def trusted_modified(path):
+    """The modified date, if it survived a copy. On Windows the created time is when the file
+    landed on this disk; a copy keeps the original modified date, so it's well before that.
+    A fresh download gets the download time for both, which says nothing about the photo."""
+    st = os.stat(path)
+    modified = datetime.fromtimestamp(st.st_mtime)
+    if st.st_mtime < st.st_ctime - 86400 and modified.year >= 2000:
+        return modified
+    return None
 
 
 def write_csv(path, rows, fields):
@@ -484,6 +519,49 @@ def write_csv(path, rows, fields):
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
         w.writerows(rows)
+
+
+# folder = where the file is under its new name; from_folder = where it was, if it moved (undo)
+LOG_FIELDS = ['run', 'time', 'action', 'folder', 'old', 'new', 'source', 'from_folder']
+HISTORY_NAME = 'rename_history.csv'
+
+
+class RenameLog:
+    """Writes each rename the moment it happens, to this run's log and to the running history
+    of every run (both next to the script), so a crash or power cut can't lose undo info."""
+
+    def __init__(self, report_dir, tag, action):
+        # Undo groups renames by run, so two runs in the same second must still get different ids
+        stamp, n = datetime.now().strftime('%Y%m%d_%H%M%S'), 1
+        self.run = stamp
+        while glob.glob(os.path.join(glob.escape(report_dir), f"rename_log_*_{self.run}.csv")):
+            n += 1
+            self.run = f"{stamp}-{n}"
+        self.action = action
+        self.path = os.path.join(report_dir, f"rename_log_{tag}_{self.run}.csv")
+        history = os.path.join(report_dir, HISTORY_NAME)
+        self.files = [open(self.path, 'w', newline='', encoding='utf-8-sig'),
+                      open(history, 'a', newline='', encoding='utf-8-sig')]
+        self.writers = [csv.DictWriter(f, fieldnames=LOG_FIELDS) for f in self.files]
+        self.writers[0].writeheader()
+        if self.files[1].tell() == 0:
+            self.writers[1].writeheader()
+        self.count = 0
+
+    def add(self, src, dst, source):
+        src_dir, dst_dir = os.path.dirname(src), os.path.dirname(dst)
+        row = dict(run=self.run, time=datetime.now().isoformat(timespec='seconds'), action=self.action,
+                   folder=dst_dir, old=os.path.basename(src), new=os.path.basename(dst), source=source,
+                   from_folder='' if os.path.normcase(src_dir) == os.path.normcase(dst_dir) else src_dir)
+        for f, w in zip(self.files, self.writers):
+            w.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+        self.count += 1
+
+    def close(self):
+        for f in self.files:
+            f.close()
 
 
 def ask(prompt, default=False):
@@ -508,18 +586,14 @@ def rename_photos(folder, suffix="", preview_only=False, shifts=()):
         print("⚠️  pymediainfo not installed - videos without a dated name can't be dated")
         print("   Install with: pip install pymediainfo")
 
-    plan = build_plan(folder, suffix, use_modified=False, shifts=shifts)
+    plan = build_plan(folder, suffix, shifts=shifts)
     undated = [e for e in plan if e['status'].startswith("no date")]
 
     if undated:
-        print(f"\n❓ {len(undated)} files have no date in their name or metadata, e.g.:")
+        print(f"\n❓ {len(undated)} files have no date in their name or metadata, and their")
+        print("   modified date is just when they were downloaded, so they're left alone, e.g.:")
         for e in undated[:5]:
             print(f"     {e['old']}")
-        if looks_freshly_downloaded(folder, [e['old'] for e in plan]):
-            print("   ⚠️  This folder looks freshly downloaded/copied: modified dates are the")
-            print("      download time, not when the photos were taken. Answer no.")
-        if ask("   Use each file's modified date for these? (yes/NO): "):
-            plan = build_plan(folder, suffix, use_modified=True, shifts=shifts)
 
     renames = [e for e in plan if e['status'] == "rename"]
     preview_path = os.path.join(report_dir, f"rename_preview_{tag}_{stamp}.csv")
@@ -550,8 +624,8 @@ def rename_photos(folder, suffix="", preview_only=False, shifts=()):
         print("Operation cancelled. No files were renamed.")
         return
 
-    log_path = os.path.join(report_dir, f"rename_log_{tag}_{stamp}.csv")
-    done, errors = [], 0
+    log = RenameLog(report_dir, tag, "rename")
+    errors = 0
     try:
         for e in renames:
             src, dst = os.path.join(folder, e['old']), os.path.join(folder, e['new'])
@@ -560,48 +634,188 @@ def rename_photos(folder, suffix="", preview_only=False, shifts=()):
                 continue
             try:
                 os.rename(src, dst)
-                done.append(dict(folder=folder, old=e['old'], new=e['new'], source=e['source']))
+                log.add(src, dst, e['source'])
             except OSError as ex:
                 errors += 1
                 print(f"❌ {e['old']}: {ex}")
     except KeyboardInterrupt:
         print("\n❌ Stopped by user - files renamed so far are in the log.")
     finally:
-        write_csv(log_path, done, ['folder', 'old', 'new', 'source'])
+        log.close()
 
     print("\n" + "=" * 60)
-    print(f"✅ Renamed: {len(done)}   ❌ Errors: {errors}")
-    print(f"↩️  To undo: python photo_renamer.py --undo \"{log_path}\"")
+    print(f"✅ Renamed: {log.count}   ❌ Errors: {errors}")
+    print(f"↩️  To undo: python photo_renamer.py --undo \"{log.path}\"")
     print("=" * 60)
 
 
-def undo(log_path):
-    with open(log_path, newline='', encoding='utf-8-sig') as f:
+def rename_via_temp(pairs, log):
+    """Rename (src, dst, source) pairs where a dst may be another pair's src (e.g. shifting a run
+    of photos by an hour): move everything to a temp name first. Returns (renamed, skipped)."""
+    moving = {os.path.normcase(s) for s, _, _ in pairs}
+    staged, skipped = [], 0
+    for src, dst, source in pairs:
+        if not os.path.exists(src) or (os.path.exists(dst) and os.path.normcase(dst) not in moving):
+            skipped += 1
+            if skipped <= 10:
+                why = "not found" if not os.path.exists(src) else "name taken"
+                print(f"⚠️  Skipped {src} → {os.path.basename(dst)} ({why})")
+            continue
+        tmp = src + '.renaming'
+        os.rename(src, tmp)
+        staged.append((src, tmp, dst, source))
+    if skipped > 10:
+        print(f"⚠️  ...{skipped - 10} more skipped")
+    done = 0
+    for src, tmp, dst, source in staged:
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(tmp, dst)
+            log.add(src, dst, source)
+            done += 1
+        except OSError as ex:
+            os.rename(tmp, src)
+            print(f"❌ {os.path.basename(src)}: {ex}")
+    return done, skipped
+
+
+def read_runs(log_arg):
+    """Rows of a log file, or of the whole history for 'all', grouped by run in the order run."""
+    report_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(report_dir, HISTORY_NAME) if log_arg.lower() == 'all' else log_arg
+    with open(path, newline='', encoding='utf-8-sig') as f:
         rows = list(csv.DictReader(f))
-    restored = 0
-    for r in reversed(rows):
-        src, dst = os.path.join(r['folder'], r['new']), os.path.join(r['folder'], r['old'])
-        if os.path.exists(src) and not os.path.exists(dst):
-            os.rename(src, dst)
-            restored += 1
-        else:
-            print(f"⚠️  Couldn't restore {r['new']} → {r['old']}")
-    print(f"↩️  Restored {restored} of {len(rows)} files")
+    runs = {}
+    for r in rows:
+        runs.setdefault(r.get('run') or 'old log', []).append(r)
+    return list(runs.items())
+
+
+def undo(log_arg, moved_to=None):
+    """Reverse runs newest first. Files moved after renaming (e.g. merged into one folder) are
+    looked for in moved_to and put back where they started. Undos are logged, so can be undone."""
+    report_dir = os.path.dirname(os.path.abspath(__file__))
+    runs = read_runs(log_arg)
+    total = sum(len(rows) for _, rows in runs)
+    print(f"↩️  Undoing {len(runs)} run(s), {total} renames, newest first")
+    log = RenameLog(report_dir, 'undo', 'undo')
+    base_run, restored, skipped = log.run, 0, 0
+    try:
+        for n, (run, rows) in enumerate(reversed(runs), 1):
+            log.run, log.action = f"{base_run}_{n:02d}", f"undo of {run}"
+            pairs = []
+            for r in reversed(rows):
+                src = os.path.join(r['folder'], r['new'])
+                if not os.path.exists(src) and moved_to and os.path.exists(os.path.join(moved_to, r['new'])):
+                    src = os.path.join(os.path.abspath(moved_to), r['new'])
+                dst = os.path.join(r.get('from_folder') or r['folder'], r['old'])
+                pairs.append((src, dst, f"undo of {run}"))
+            done, missed = rename_via_temp(pairs, log)
+            print(f"   run {run} ({rows[0].get('action', 'rename')}): restored {done}, skipped {missed}")
+            restored, skipped = restored + done, skipped + missed
+    finally:
+        log.close()
+    print(f"↩️  Restored {restored} of {total} files" + (f", {skipped} skipped" if skipped else ""))
+    print(f"   This undo is logged too: {log.path}")
+
+
+def fix_times(folder, fixes, only="", preview_only=False):
+    """Shift the date in names this script already wrote, e.g. after spotting a wrong camera clock."""
+    folder = os.path.abspath(folder)
+    report_dir = os.path.dirname(os.path.abspath(__file__))
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tag = clean_label(os.path.basename(folder)) or 'folder'
+    print(f"\n📁 Folder: {folder}" + (f"   (only *_{only} files)" if only else ""))
+
+    names = os.listdir(folder)
+    plan, used = [], {f[3]: 0 for f in fixes}
+    for name in sorted(names, key=str.lower):
+        stem, ext = os.path.splitext(name)
+        if not (name.lower().endswith(MEDIA_EXTS) and is_canonical(name)):
+            continue
+        if only and not stem.lower().endswith('_' + only.lower()):
+            continue
+        dt = make_dt(*NAME_DATE_RE.match(stem).groups())
+        fix = next((f for f in fixes if f[0] <= dt <= f[1]), None)
+        if fix:
+            used[fix[3]] += 1
+            plan.append(dict(old=name, stem=stem, ext=ext, dt=dt + fix[2], source=f"time fix {fix[3]}"))
+
+    # Names not moving stay taken; give clashes a _01, _02 after the new date
+    moving = {e['old'].lower() for e in plan}
+    occupied = {n.lower() for n in names} - moving
+    for e in sorted(plan, key=lambda e: (e['dt'], e['old'].lower())):
+        base, rest = e['dt'].strftime('%Y%m%d_%H%M%S'), e['stem'][15:]
+        candidate, n = base + rest, 0
+        while (candidate + e['ext']).lower() in occupied:
+            n += 1
+            candidate = f"{base}_{n:02d}{rest}"
+        e['new'] = candidate + e['ext']
+        occupied.add(e['new'].lower())
+
+    for spec, n in used.items():
+        print(f"   🕒 {spec}: {n} files" + ("   ⚠️  matched nothing" if not n else ""))
+    if not plan:
+        print("\n✅ Nothing to fix.")
+        return
+    preview_path = os.path.join(report_dir, f"fix_preview_{tag}_{stamp}.csv")
+    write_csv(preview_path, plan, ['old', 'new', 'source'])
+    print("\n   Examples:")
+    for e in plan[:10]:
+        print(f"     {e['old']}  →  {e['new']}")
+    print(f"\n📄 Full list: {preview_path}")
+    if preview_only:
+        print("\n👀 Preview only - no files were renamed.")
+        return
+    if not ask(f"\n⚠️  Rename {len(plan)} files? (yes/no): "):
+        print("Operation cancelled. No files were renamed.")
+        return
+
+    log = RenameLog(report_dir, f"{tag}_fix", "time fix")
+    try:
+        done, _ = rename_via_temp([(os.path.join(folder, e['old']), os.path.join(folder, e['new']), e['source'])
+                                   for e in plan], log)
+    finally:
+        log.close()
+    print("\n" + "=" * 60)
+    print(f"✅ Renamed: {done} of {len(plan)}")
+    print(f"↩️  To undo: python photo_renamer.py --undo \"{log.path}\"")
+    print("=" * 60)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Rename photos/videos to YYYYMMDD_HHMMSS by date taken")
     parser.add_argument('folder', nargs='?', help="folder to rename (asked for if omitted)")
-    parser.add_argument('--suffix', default=None, help="text to add after the date, e.g. Al")
+    parser.add_argument('--suffix', default=None, help="text to add after the date (default: the folder's name)")
     parser.add_argument('--preview', action='store_true', help="write the preview list only, rename nothing")
-    parser.add_argument('--undo', metavar='LOG', help="reverse a previous run using its rename_log CSV")
+    parser.add_argument('--undo', metavar='LOG', help="reverse a run using its rename_log CSV, or 'all' "
+                                                      "to reverse everything in rename_history.csv")
+    parser.add_argument('--moved-to', metavar='FOLDER',
+                        help="with --undo: where the files are now if they were moved after renaming; "
+                             "they're put back in their original folders")
     parser.add_argument('--shift', action='append', default=[], metavar='RANGE=OFFSET',
                         help="fix a wrong camera clock, e.g. DSC_0925-DSC_1369=+13h or a text file of these "
                              "(one per line); repeatable")
+    parser.add_argument('--fix-time', action='append', default=[], metavar='DATES=OFFSET',
+                        help="after renaming, shift already-dated names in a date range, "
+                             "e.g. 20260101-20260719=-1h; repeatable")
+    parser.add_argument('--only', default='', metavar='SUFFIX',
+                        help="with --fix-time: only files ending in this suffix, e.g. Camera")
     args = parser.parse_args()
 
     if args.undo:
-        undo(args.undo)
+        undo(args.undo, args.moved_to)
+        return
+    if args.fix_time:
+        if not args.folder or not os.path.isdir(args.folder):
+            print("\n❌ --fix-time needs a folder")
+            return
+        try:
+            fixes = [parse_fix(s) for item in args.fix_time for s in item.split(';') if s.strip()]
+        except ValueError as ex:
+            print(f"\n❌ {ex}")
+            return
+        fix_times(args.folder, fixes, clean_label(args.only), args.preview)
         return
 
     print("=" * 60)
@@ -617,7 +831,7 @@ def main():
         return
     suffix = args.suffix
     if suffix is None:
-        suffix = input("\n🏷️  Enter suffix to add (or press Enter for none): ").strip()
+        suffix = os.path.basename(os.path.abspath(folder))
     shift_items = args.shift
     if not args.folder:
         answer = input("\n🕒 Camera clock fixes - a shifts file, or e.g. DSC_0925-DSC_1369=+13h; DSC_1370-DSC_1796=-2h\n"

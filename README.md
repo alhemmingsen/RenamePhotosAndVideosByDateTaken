@@ -7,13 +7,14 @@ so they sort chronologically. Shows a preview of every rename first, and can und
 
 ```
 pip install pillow pymediainfo          # pillow-heif optional, for HEIC files without a dated name
-python photo_renamer.py                  # prompts for the folder and an optional suffix
-python photo_renamer.py "D:\Photos" --suffix Al --preview
-python photo_renamer.py --undo rename_log_Photos_20251121_160000.csv
+python photo_renamer.py                  # prompts for the folder
+python photo_renamer.py "D:\Photos\Al" --preview      # names end in _Al (the folder's name)
+python photo_renamer.py "D:\Photos\Al" --suffix Phone  # or pick the suffix yourself
+python photo_renamer.py --undo rename_log_Al_20251121_160000.csv
 ```
 
 Each run writes `rename_preview_<folder>_<time>.csv` (every file: old name, new name, date source, status)
-next to the script, then asks before renaming anything. Applying writes `rename_log_...csv`, which `--undo` reverses.
+next to the script, then asks before renaming anything. See [Logging and undo](#logging-and-undo).
 
 ## How the date is chosen
 
@@ -25,7 +26,7 @@ next to the script, then asks before renaming anything. Applying writes `rename_
 | 3 | EXIF Date Taken, then EXIF DateTime | JPEG, PNG, HEIC, and RAW (NEF, CR2, DNG, ARW...) |
 | 4 | Embedded video date (UTC converted to local) | `DSC_0013.MOV` |
 | 5 | Save/export date in the filename | `BandPhoto_2025_04_22_...`, `FB_IMG_<epoch>`, `IMG-20250601-WA0009`, `lv_..._20251027181335` |
-| 6 | File modified date — **only if you answer yes** | Wrong for fresh downloads (Google Photos, cloud, copies), so the default is no |
+| 6 | File modified date — **only if it survived a copy** | Used when it's over a day older than the file's created time (when it landed on this disk). Fresh downloads (Google Photos, cloud) get the download time for both, so they're skipped |
 
 Files with no date are left alone and listed in the preview. WhatsApp names carry only the day, so the
 file's modified time is used when it falls on that same day; otherwise the time is 00:00:00.
@@ -54,9 +55,22 @@ embedded UTC time plus a whole time-zone step), so one shift fits a camera's pho
 
 To work out the offset, compare a camera shot with a phone photo of the same moment.
 
+### After renaming
+
+Once renamed, the `DSC_` numbers are gone, so a clock problem spotted later is fixed by date range instead.
+`--fix-time` shifts the date in names this script already wrote, keeping the rest of the name. It works on
+a merged folder too: `--only` limits it to one device's suffix.
+
+```
+python photo_renamer.py "D:\Merged" --fix-time 20250101-20250719=-1h --only Camera --preview
+python photo_renamer.py "D:\Merged" --fix-time 20250405_1200-20250405_1830=+30m --only Camera
+```
+
+Range ends are inclusive (`20250719` as an end means all of that day). It's logged and undoable like any run.
+
 ## Merging devices into one folder
 
-Rename each device's folder with its own suffix (`--suffix Al`, `--suffix Camera`, ...) before merging.
+Rename each device's folder before merging; each gets its folder's name as a suffix (`_Al`, `_Camera`, ...).
 Two devices can take photos in the same second, and without a suffix the names would collide when copied
 together. Explorer's name sort then interleaves all devices in true chronological order.
 
@@ -67,4 +81,20 @@ together. Explorer's name sort then interleaves all devices in true chronologica
   `Zoo_Day.jpeg` → `20250421_190017_Zoo_Day.jpeg`. Camera names (`DSC_0001`, `IMG_1234`, `141A9505`) are dropped.
 - RAW files take the same new name as their JPG twin: `DSC_0001.JPG` + `DSC_0001.NEF` → `20250406_125400.jpg` + `.nef`.
 - Same-second clashes get `_01`, `_02`... in capture order. Nothing is ever overwritten.
-- An optional suffix goes last: `20250406_125400_Al.jpg` (also added to files that are already dated).
+- The suffix (the folder's name unless `--suffix` is given) goes last: `20250406_125400_Al.jpg`
+  (also added to files that are already dated).
+
+## Logging and undo
+
+Every rename is written to disk the moment it happens, so a crash or power cut loses nothing. Each one goes to
+that run's `rename_log_<folder>_<run>.csv` and to `rename_history.csv`, a running record of every run
+(both next to the script).
+
+```
+python photo_renamer.py --undo rename_log_Al_20251121_160000.csv   # one run
+python photo_renamer.py --undo all                                  # every run, newest first
+python photo_renamer.py --undo all --moved-to "D:\Merged"           # files were moved after renaming
+```
+
+`--moved-to` finds files that were moved after renaming (e.g. merged into one folder) and puts them back in
+their original folders under their original names. Undos are logged too, so an undo can itself be undone.
