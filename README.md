@@ -1,6 +1,6 @@
 # RenamePhotosAndVideosByDateTaken
 
-Renames a folder of photos and videos to `YYYYMMDD_HHMMSS.ext` by the date they were taken,
+Renames a folder of photos and videos to `YYYYMMDD HHMMSS.ext` by the date they were taken,
 so they sort chronologically. Shows a preview of every rename first, and can undo a run.
 
 ## Usage
@@ -8,7 +8,7 @@ so they sort chronologically. Shows a preview of every rename first, and can und
 ```
 pip install pillow pymediainfo          # pillow-heif optional, for HEIC files without a dated name
 python photo_renamer.py                  # prompts for the folder
-python photo_renamer.py "D:\Photos\Al" --preview      # names end in _Al (the folder's name)
+python photo_renamer.py "D:\Photos\Al" --preview      # names end in " Al" (the folder's name)
 python photo_renamer.py "D:\Photos\Al" --suffix Phone  # or pick the suffix yourself
 python photo_renamer.py --undo rename_log_Al_20251121_160000.csv
 ```
@@ -20,7 +20,7 @@ next to the script, then asks before renaming anything. See [Logging and undo](#
 
 | Order | Source | Examples |
 |---|---|---|
-| — | **Name already starts with `YYYYMMDD_HHMMSS`: left alone** | `20250727_193327.jpg`, `20250727_193327(1).jpg`, `20250721_165426_020.jpg` |
+| — | **Name already starts with `YYYYMMDD HHMMSS` or `YYYYMMDD_HHMMSS`: left alone** | `20250727 193327.jpg`, `20250727_193327.jpg`, `20250727_193327(1).jpg`, `20250721_165426_020.jpg` |
 | 1 | Capture date in the filename | `IMG_20250321_111214.heic`, `Screenshot_20250419_163727_Chrome.jpg`, `PXL_...` |
 | 2 | Google Takeout JSON sidecar | `photoTakenTime` |
 | 3 | EXIF Date Taken, then EXIF DateTime | JPEG, PNG, HEIC, and RAW (NEF, CR2, DNG, ARW...) |
@@ -70,19 +70,21 @@ Range ends are inclusive (`20250719` as an end means all of that day). It's logg
 
 ## Merging devices into one folder
 
-Rename each device's folder before merging; each gets its folder's name as a suffix (`_Al`, `_Camera`, ...).
+Rename each device's folder before merging; each gets its folder's name as a suffix (` Al`, ` Camera`, ...).
 Two devices can take photos in the same second, and without a suffix the names would collide when copied
 together. Explorer's name sort then interleaves all devices in true chronological order.
 
 ## Naming
 
 - Descriptive parts of the old name are kept after the date:
-  `Screenshot_20250419_163727_Chrome.jpg` → `20250419_163727_Screenshot_Chrome.jpg`,
-  `Zoo_Day.jpeg` → `20250421_190017_Zoo_Day.jpeg`. Camera names (`DSC_0001`, `IMG_1234`, `141A9505`) are dropped.
-- RAW files take the same new name as their JPG twin: `DSC_0001.JPG` + `DSC_0001.NEF` → `20250406_125400.jpg` + `.nef`.
+  `Screenshot_20250419_163727_Chrome.jpg` → `20250419 163727 Screenshot_Chrome.jpg`,
+  `Zoo_Day.jpeg` → `20250421 190017 Zoo_Day.jpeg`. Camera names (`DSC_0001`, `IMG_1234`, `141A9505`) are dropped.
+- RAW files take the same new name as their JPG twin: `DSC_0001.JPG` + `DSC_0001.NEF` → `20250406 125400.jpg` + `.nef`.
 - Same-second clashes get `_01`, `_02`... in capture order. Nothing is ever overwritten.
-- The suffix (the folder's name unless `--suffix` is given) goes last: `20250406_125400_Al.jpg`
+- The suffix (the folder's name unless `--suffix` is given) goes last, after a space: `20250406 125400 Al.jpg`
   (also added to files that are already dated).
+- Versions before November 2026 wrote `20250406_125400_Al.jpg` (underscores). Those names still count as
+  already dated, are left as they are, and `--fix-time` keeps their underscores.
 
 ## Logging and undo
 

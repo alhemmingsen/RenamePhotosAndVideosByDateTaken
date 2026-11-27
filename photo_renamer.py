@@ -1,8 +1,8 @@
 """
-PHOTO RENAMER - rename photos/videos to YYYYMMDD_HHMMSS by date taken.
+PHOTO RENAMER - rename photos/videos to "YYYYMMDD HHMMSS" by date taken.
 
 Rules:
-  * A file whose name already starts with a valid YYYYMMDD_HHMMSS is left alone
+  * A file whose name already starts with a valid YYYYMMDD HHMMSS (or YYYYMMDD_HHMMSS) is left alone
     (phones name files at the moment the shutter is pressed, in local time,
     which is the best date there is - including on trips abroad).
   * Otherwise the date comes from, in order:
@@ -13,8 +13,8 @@ Rules:
       5. a save/download date in the name (BandPhoto_, FB_IMG_<epoch>, IMG-YYYYMMDD-WA, lv_..., epoch)
       6. file modified date              - only if you say yes (wrong for fresh downloads)
   * Files with no date are left alone and listed in the preview.
-  * Descriptive names are kept after the date:  Zoo_Day.jpg -> 20250421_190017_Zoo_Day.jpg
-    Screenshot_20250419_163727_Chrome.jpg -> 20250419_163727_Screenshot_Chrome.jpg
+  * Descriptive names are kept after the date:  Zoo_Day.jpg -> "20250421 190017 Zoo_Day.jpg"
+    Screenshot_20250419_163727_Chrome.jpg -> "20250419 163727 Screenshot_Chrome.jpg"
   * RAW files (DSC_0001.NEF) get the same new name as their JPG twin (DSC_0001.JPG).
   * Name clashes get _01, _02 ... never an overwrite.
   * Every run writes a preview CSV first; applying writes a log that --undo can reverse.
@@ -64,8 +64,12 @@ VIDEO_EXTS = ('.mp4', '.mov', '.3gp', '.m4v', '.avi', '.mkv')
 MEDIA_EXTS = IMAGE_EXTS + RAW_EXTS + VIDEO_EXTS
 TIFF_RAW_EXTS = ('.nef', '.cr2', '.arw', '.dng', '.orf', '.rw2', '.tif', '.tiff')
 
-CANONICAL_RE = re.compile(r'^(\d{8}_\d{6})')
-NAME_DATE_RE = re.compile(r'(?<!\d)(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})')
+# New names look like "20260420 210736 Trip.avi". Earlier versions wrote
+# "20260420_210736_Trip.avi"; both forms are recognised as already dated.
+DATE_FMT = '%Y%m%d %H%M%S'
+SEP = ' '   # between the date-time and what follows (label, suffix)
+CANONICAL_RE = re.compile(r'^(\d{8}[_ ]\d{6})')
+NAME_DATE_RE = re.compile(r'(?<!\d)(\d{4})(\d{2})(\d{2})[_ ](\d{2})(\d{2})(\d{2})')
 
 # Camera/app prefixes that carry no meaning once the date is in front
 GENERIC_PREFIXES = {'img', 'vid', 'pxl', 'mvimg', 'pano', 'burst', 'video', 'photo'}
@@ -441,8 +445,8 @@ def build_plan(folder, suffix, shifts=()):
         shift = shift_for(stem, shifts)
         if is_canonical(f) and not shift:
             new_stem = stem
-            if suffix and not stem.endswith('_' + suffix):
-                new_stem = f"{stem}_{suffix}"
+            if suffix and not stem.endswith(('_' + suffix, ' ' + suffix)):
+                new_stem = f"{stem}{SEP}{suffix}"
             occupied.add((new_stem + ext).lower())
             plan.append(dict(old=f, new_stem=new_stem, ext=ext, date=stem[:15],
                              source="Already dated name", raw=ext.lower() in RAW_EXTS))
@@ -470,16 +474,16 @@ def build_plan(folder, suffix, shifts=()):
         if twin and (twin + ext).lower() not in occupied:
             entry.update(new_stem=twin, date=twin[:15], source=entry['source'] + " (paired with JPG)")
         elif p['dt']:
-            base = p['dt'].strftime('%Y%m%d_%H%M%S')
+            base = p['dt'].strftime(DATE_FMT)
             label = label_for(p['stem'])
             if label:
-                base = f"{base}_{label}"
-            tail = f"_{suffix}" if suffix else ""
+                base = f"{base}{SEP}{label}"
+            tail = f"{SEP}{suffix}" if suffix else ""
             candidate, n = base + tail, 0
             while (candidate + ext).lower() in occupied:
                 n += 1
                 candidate = f"{base}_{n:02d}{tail}"
-            entry.update(new_stem=candidate, date=p['dt'].strftime('%Y%m%d_%H%M%S'))
+            entry.update(new_stem=candidate, date=p['dt'].strftime(DATE_FMT))
         else:
             entry.update(new_stem=p['stem'], ext=p['ext'], date='')
         new_name = entry['new_stem'] + entry['ext']
@@ -581,7 +585,7 @@ def rename_photos(folder, suffix="", preview_only=False, shifts=()):
 
     print(f"\n📁 Folder: {folder}")
     if suffix:
-        print(f"🏷️  Suffix: _{suffix}")
+        print(f"🏷️  Suffix: '{SEP}{suffix}'")
     if not MEDIAINFO_AVAILABLE:
         print("⚠️  pymediainfo not installed - videos without a dated name can't be dated")
         print("   Install with: pip install pymediainfo")
@@ -733,7 +737,7 @@ def fix_times(folder, fixes, only="", preview_only=False):
         stem, ext = os.path.splitext(name)
         if not (name.lower().endswith(MEDIA_EXTS) and is_canonical(name)):
             continue
-        if only and not stem.lower().endswith('_' + only.lower()):
+        if only and not stem.lower().endswith(('_' + only.lower(), ' ' + only.lower())):
             continue
         dt = make_dt(*NAME_DATE_RE.match(stem).groups())
         fix = next((f for f in fixes if f[0] <= dt <= f[1]), None)
@@ -745,7 +749,8 @@ def fix_times(folder, fixes, only="", preview_only=False):
     moving = {e['old'].lower() for e in plan}
     occupied = {n.lower() for n in names} - moving
     for e in sorted(plan, key=lambda e: (e['dt'], e['old'].lower())):
-        base, rest = e['dt'].strftime('%Y%m%d_%H%M%S'), e['stem'][15:]
+        # keep the file's existing date/time separator so old '_' folders stay consistent
+        base, rest = e['dt'].strftime('%Y%m%d' + e['stem'][8] + '%H%M%S'), e['stem'][15:]
         candidate, n = base + rest, 0
         while (candidate + e['ext']).lower() in occupied:
             n += 1
@@ -784,7 +789,7 @@ def fix_times(folder, fixes, only="", preview_only=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Rename photos/videos to YYYYMMDD_HHMMSS by date taken")
+    parser = argparse.ArgumentParser(description="Rename photos/videos to 'YYYYMMDD HHMMSS' by date taken")
     parser.add_argument('folder', nargs='?', help="folder to rename (asked for if omitted)")
     parser.add_argument('--suffix', default=None, help="text to add after the date (default: the folder's name)")
     parser.add_argument('--preview', action='store_true', help="write the preview list only, rename nothing")
@@ -821,9 +826,9 @@ def main():
     print("=" * 60)
     print("📷 PHOTO RENAMER - Rename by Date Taken")
     print("=" * 60)
-    print("  IMG_20250321_111214.jpg     → 20250321_111214.jpg")
-    print("  DSC_0001.JPG + DSC_0001.NEF → 20250406_125400.jpg + .nef")
-    print("  20250727_193327.jpg         → left alone (already dated)")
+    print("  IMG_20250321_111214.jpg     → 20250321 111214.jpg")
+    print("  DSC_0001.JPG + DSC_0001.NEF → 20250406 125400.jpg + .nef")
+    print("  20250727 193327.jpg         → left alone (already dated)")
 
     folder = args.folder or input("\n📁 Enter folder path (or drag folder here): ").strip().strip('"')
     if not os.path.isdir(folder):
